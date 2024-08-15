@@ -219,25 +219,26 @@ class FeedForward(nn.Module):
     def __init__(
         self,
         dim: int,
-        hidden_dim: int,
+        intermediate_size: int,
         multiple_of: int,
         ffn_dim_multiplier: Optional[float],
     ):
         super().__init__()
-        hidden_dim = int(2 * hidden_dim / 3)
+        intermediate_size = int(2 * intermediate_size / 3)
         # custom dim factor multiplier
         if ffn_dim_multiplier is not None:
-            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
-        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+            intermediate_size = int(ffn_dim_multiplier * intermediate_size)
+        intermediate_size = multiple_of * ((intermediate_size + multiple_of - 1) // multiple_of)
 
         self.w1 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+            dim, intermediate_size, bias=False, gather_output=False, init_method=lambda x: x
         )
+        # 行并行Linear,Y=XA+b, 对A各行进行拆分
         self.w2 = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+            intermediate_size, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
         )
         self.w3 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+            dim, intermediate_size, bias=False, gather_output=False, init_method=lambda x: x
         )
 
     def forward(self, x):
@@ -253,7 +254,7 @@ class TransformerBlock(nn.Module):
         self.attention = Attention(args)
         self.feed_forward = FeedForward(
             dim=args.dim,
-            hidden_dim=4 * args.dim,
+            intermediate_size=4 * args.dim,
             multiple_of=args.multiple_of,
             ffn_dim_multiplier=args.ffn_dim_multiplier,
         )
@@ -289,6 +290,7 @@ class Transformer(nn.Module):
             self.layers.append(TransformerBlock(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        # 列并行Linear,Y=XA+b, 对A各列进行拆分
         self.output = ColumnParallelLinear(
             params.dim, params.vocab_size, bias=False, init_method=lambda x: x
         )
