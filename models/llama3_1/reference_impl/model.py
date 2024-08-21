@@ -67,36 +67,141 @@ def apply_scaling(freqs: torch.Tensor):
     return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
 
+"""
+precompute_freqs_cis中的cis是 "cosine" 和 "sine" 的缩写，它经常在数学中使用来表示复数的极坐标形式。
+具体来说，给定一个角度theta，其对应的复数可以表示为：
+cis(theta) = cos(theta) + i*sin(theta), 即一般形式的欧拉公式
+"cis" 表示的是一个复数，其实部是角度θ的余弦值，而虚部是角度θ的正弦值, theta表示幅角 ,这种表示方法在复数分析、信号处理等领域中非常有用。
+
+因此，故名思义，该函数的目的是预计算一个复数频率张量。该函数有两个入参，dim和end。
+dim就是每个attention_head中的维度，在这里就是head_dim = hidden/head_num=4096/32=128。
+end是self.params.max_seq_len * 2，也就是4096，这也是Llama2最大的token处理数量。计算过程解释见注释：
+"""
 def precompute_freqs_cis(
-    dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False
+    dim: int, # head_dim =128
+    seq_length: int, # max_seq_len*2
+    theta: float = 10000.0,
+    use_scaled: bool = False
 ):
+    # dim = head_dim = 128
+    # seq_len = max_seq_len*2 = 4096
+    # 幅角最小单位：10000^(-2i/dim)
+    # torch.arange(0, dim, 2) [0, 2, 4, 6, 8, 10,..., 124, 126] 共64个
+    # torch.arange(0, dim, 2)[: (dim // 2)] 保证是64个
+    # freqs = [1/10000.0^(0/128), 1/10000.0^(2/128), 1/10000.0^(4/128), ..., 1/10000.0^(126/128)]
+    # freqs.shape: [dim//2]
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    # index_of_seq: [0, 1, 2, ..., 4095]
+    # index_of_seq.shape:[end]
+    index_of_seq = torch.arange(seq_length, device=freqs.device, dtype=torch.float32)
     if use_scaled:
         freqs = apply_scaling(freqs)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+
+    """
+    # freqs 得到 freqs和t的笛卡尔积，维度为:[seq_length, embed_dim//2] =（4096，64）
+    # freqs = [[0, 0, 0,..., 0],
+    #          [1/10000.0^(0/128), 1/10000.0^(2/128), 1/10000.0^(4/128), ..., 1/10000.0^(126/128)],
+    #          [2/10000.0^(0/128), 2/10000.0^(2/128), 2/10000.0^(4/128), ..., 2/10000.0^(126/128)],
+    #          ...,
+    #          [4095/10000.0^(0/128), 4095/10000.0^(2/128), 4095/10000.0^(4/128), ..., 4095/10000.0^(126/128)]]
+    其公式值为：
+    [
+        0*theta(0), 0*theta(1), ..., 0*theta(dim/2-1),
+        1*theta(0), 1*theta(1), ..., 1*theta(dim/2-1),
+        ...
+        m*theta(0), m*theta(1), ..., m*theta(dim/2-1),
+        ...
+        seq_len*theta(0), seq_len*theta(1), ..., seq_len*theta(dim/2-1),
+        ]
+    """
+    freqs = torch.outer(index_of_seq, freqs)
+
+    # 在PyTorch中，torch.polar用于通过极坐标（magnitude和angle）来创建一个复数张量。
+    # 这个函数接受两个张量作为输入：一个张量包含复数的模（magnitude，也就是复数的长度），
+    # 另一个张量包含复数的角度（angle，也就是复数的相位角），然后返回一个相应的复数张量。
+    # 下面就是创建模长为1的，有不同相位角的复数张量。
+    # freqs_cis:[seq_length, embed_dim//2]
+    freqs_cis = torch.polar(abs=torch.ones_like(freqs), angle=freqs)  # complex64
     return freqs_cis
 
-
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    """
+    注意freqs_cis的维度并不是（4096，64），而是截取了seqlen的一部分，freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]。
+    """
+    # freqs_cis.shape = [1024, 64]
+    # x.shape = [2, 1024, 32, 64]
     ndim = x.ndim
     assert 0 <= 1 < ndim
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    # freqs_cis:[seq_length, embed_dim//2]
+    # x:[batch, query_seqlen, head_num, head_dim/2]
+    # 将freqs_cis.shape变为[batch=1, query_seqlen=1024, head_num=1, head_dim/2=64]
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
 
+"""
+与其它实现不同，meta的实现直接在复数空间相乘得到rope编码，即
+f(q,m)=q_complex*e^(i*m*theta)
+"""
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    # xq:[batch, seqlen, head_num, head_dim]
+    # xk:[batch, seqlen, n_kv_head, head_dim]
+
+    """
+    将xq和xk的最后一个维度进行复数运算，得到新的xq和xk
+    为了进行复数运算，需要将xq和xk的最后一个维度展开为2维
+    例如，xq的形状为[2, seq_len, 32, 128], reshape后为[2, seq_len, 32 , 64, 2]
+    view_as_complex函数可以将张量中的最后一维的两个元素作为实部和虚部合成一个复数
+
+    xq:[batch, query_seqlen, head_num, head_dim]
+    -> [batch, query_seqlen, head_num, head_dim/2, 2]
+    torch.view_as_complex:其中输入张量的最后一个维度必须为2,分别表示复数的实部和虚部,其中前半部分为实部，后半部分为虚部
+    具体而言，其中的复数为：[x0+j*x(dim/2+1), x1+j*x(dim/2+2), ...., x(dim/2)+j*x(dim-1)], 长度为head_dim/2
+    此处与原RoFormer中的Rope有区别，oFormer中是将相邻位置(q0,q1)作为复数的实部与虚部, 之所以这样计算，只是方便而己
+    xq_complex: [batch, query_seqlen, head_num, head_dim/2]
+    """
+    xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+
+    # xk:[batch, seqlen, n_kv_head, head_dim]
+    # -> [batch, key_seqlen, head_num, head_dim/2, 2]
+    # xk_complex: [batch, key_seqlen, head_num, head_dim/2]
+    xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+
+    """
+    freqs_cis:[seq_length, embed_dim//2]
+    其值为：
+    [
+    0*theta(0), 0*theta(1), ..., 0*theta(dim/2-1),
+    1*theta(0), 1*theta(1), ..., 1*theta(dim/2-1),
+    ...
+    m*theta(0), m*theta(1), ..., m*theta(dim/2-1),
+    ...
+    seq_len*theta(0), seq_len*theta(1), ..., seq_len*theta(dim/2-1),
+    ]
+    xq_complex: [batch, query_seqlen, head_num, head_dim/2]
+    将freqs_cis.shape变为[batch=1, query_seqlen=1024, head_num=1, head_dim/2=64]
+    """
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_complex)
+
+    # xq_complex: [batch, query_seqlen, head_num, head_dim/2]
+    # freqs_cis:[batch=1, query_seqlen=1024, head_num=1, head_dim/2=64]
+    # view_as_real和view_as_complex相反，可以将张量中最后一维的复数拆出实部和虚部
+    # (xq_ * freqs_cis).shape = [batch=2, seq_len, head_num=32 , head_dim/2=64]
+    # torch.view_as_real(xq_ * freqs_cis).shape = [batch=2, seq_len, head_num=32 , head_dim/2=64, 2]
+    # flatten(3)将张量展平为[batch=2, seq_len, head_num=32, head_dim=128]，3代表从的第3个维度开始展平
+    #
+    # xq_out:[batch, query_seqlen=1024, head_num, head_dim]
+    # xk_out:[batch, query_seqlen=1024, head_num, head_dim]
+    # ROPE编码, f(q, m) = q_complex*e^(i*m*theta)
+    # 其具有相对位置信息：<f(q,m), f(k,n)> = g(q,k,m-n) = (q.T)*R(n-m)*k
+    # 即将xq转为复数后，与位置m的复数相乘，得到rope
+    xq_out = torch.view_as_real(xq_complex * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_complex * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -121,6 +226,17 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
+
+        # ColumnParallelLinear是一个在大规模并行训练中使用的术语，特别是在训练大型的深度学习模型，
+        # 如Transformer模型时。在模型并行训练中，一个大型的矩阵（例如神经网络的权重矩阵）会被分割成不同的列，
+        # 并分散到不同的计算设备（如GPU）上。
+        #
+        # 在ColumnParallelLinear的情况下，每个计算设备存储权重矩阵的一部分列，而不是整个矩阵。
+        # 每个设备计算它自己的前向传播部分，并将结果发送给其他设备以进行进一步的处理或合并结果。
+        # 对于反向传播和梯度计算，每个设备计算其自己列的梯度，并可能需要与其他设备交换信息以更新权重。
+        #
+        # 这种方式可以显著减少每个设备上的内存需求，并允许训练更大的模型，因为模型的不同部分可以分布在多个设备上。
+        # ColumnParallelLinear和RowParallelLinear（另一种将权重矩阵按行划分的方法）是实现模型并行的两种常见策略。
 
         self.wq = ColumnParallelLinear(
             args.dim,
@@ -151,6 +267,7 @@ class Attention(nn.Module):
             init_method=lambda x: x,
         )
 
+        # kv_cache是缓存键值对，在训练过程中，我们只保存最近n个键值对
         self.cache_k = torch.zeros(
             (
                 args.max_batch_size,
@@ -168,6 +285,17 @@ class Attention(nn.Module):
             )
         ).cuda()
 
+    """
+    大模型一般是分布式训练，这里涉及到几个概念。n_heads是注意力头的总个数，由于并行机制，每个进程会有n_local_heads个注意力头。
+    由于计算当前位置的Attention Score依赖于之前所有的kv，因此需要将kv缓存下来。
+    为了减少空间复杂度，可以对kv的头个数n_kv_heads进行调整，这个值一般小于等于n_heads，
+    n_heads是n_kv_heads的整数倍，这个倍数也就是n_rep。
+    相应的，每个进程会有n_local_kv_heads个注意力头。
+    每个头的维度为head_dim=dim//n_heads。
+
+    例如：n_heads=32，model_parallel_size（并行数量）= 4，n_kv_heads = 8，
+    n_local_heads = 32/4， n_local_kv_heads = 8/4，n_rep = 32/8。
+    """
     def forward(
         self,
         x: torch.Tensor,
@@ -175,43 +303,48 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
-        bsz, seqlen, _ = x.shape
+        batch_size, seqlen, hidden_size = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        # xq:[batch, seqlen, head_num, head_dim]
+        # xk:[batch, seqlen, n_kv_head, head_dim]
+        # xv:[batch, seqlen, h_kv_head, head_dim]
+        xq = xq.view(batch_size, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(batch_size, seqlen, self.n_local_kv_heads, self.head_dim) # 注意：这里就是group query attention
+        xv = xv.view(batch_size, seqlen, self.n_local_kv_heads, self.head_dim)
 
+        # 对当前token的qkv计算位置编码ROPE
+        # xq:[batch, seqlen, head_num, head_dim]
+        # xk:[batch, seqlen, n_kv_head, head_dim]
+        # freqs_cis:[seq_length, embed_dim//2]
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
+        # 缓存当前token的kv
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        self.cache_k[:batch_size, start_pos: start_pos + seqlen] = xk
+        self.cache_v[:batch_size, start_pos: start_pos + seqlen] = xv
 
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+        # 取出前seqlen个token的kv缓存
+        keys = self.cache_k[:batch_size, : start_pos + seqlen]
+        values = self.cache_v[:batch_size, : start_pos + seqlen]
 
-        # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(
-            keys, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        values = repeat_kv(
-            values, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        # repeat k/v heads if n_kv_heads < n_heads, 即group query attention
+        # 将kv重复填充，使kv和q的头数个数相同
+        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv( values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(
-            1, 2
-        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose( 1, 2 )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        output = output.transpose(1, 2).contiguous().view(batch_size, seqlen, -1)
         return self.wo(output)
 
 
@@ -230,10 +363,27 @@ class FeedForward(nn.Module):
             intermediate_size = int(ffn_dim_multiplier * intermediate_size)
         intermediate_size = multiple_of * ((intermediate_size + multiple_of - 1) // multiple_of)
 
+        #
+        """
+        Y = XA + b, 对A进行 列分块并行,Y=XA+b, 对A各行进行拆分
+          A = | A_1, A_2,..., A_p |
+        fairscale现已被fsdp替代  
+        """
         self.w1 = ColumnParallelLinear(
             dim, intermediate_size, bias=False, gather_output=False, init_method=lambda x: x
         )
-        # 行并行Linear,Y=XA+b, 对A各行进行拆分
+
+        #
+        """
+        Y = XA + b, 对A进行 行分块并行,Y=XA+b, 对A各行进行拆分
+               -   -
+              | A_1 |
+              | .   |
+          A = | .   |        X = [X_1, ..., X_p]
+              | .   |
+              | A_p |
+               -   -
+        """
         self.w2 = RowParallelLinear(
             intermediate_size, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
         )
@@ -269,6 +419,7 @@ class TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
+        # freqs_cis:[seq_length, embed_dim//2]
         h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
