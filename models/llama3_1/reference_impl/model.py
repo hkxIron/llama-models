@@ -160,9 +160,8 @@ def apply_rotary_emb(
 
     xq:[batch, query_seqlen, head_num, head_dim]
     -> [batch, query_seqlen, head_num, head_dim/2, 2]
-    torch.view_as_complex:其中输入张量的最后一个维度必须为2,分别表示复数的实部和虚部,其中前半部分为实部，后半部分为虚部
-    具体而言，其中的复数为：[x0+j*x(dim/2+1), x1+j*x(dim/2+2), ...., x(dim/2)+j*x(dim-1)], 长度为head_dim/2
-    此处与原RoFormer中的Rope有区别，oFormer中是将相邻位置(q0,q1)作为复数的实部与虚部, 之所以这样计算，只是方便而己
+    torch.view_as_complex:其中输入张量的最后一个维度必须为2, 将相邻位置(q0,q1)作为复数的实部与虚部,其中偶数部分为实部，奇数部分为虚部
+    具体而言，其中的复数为：[x0+j*x(1), x2+j*x3, ...., x(dim_2)+j*x(dim-1)], 长度为head_dim/2
     xq_complex: [batch, query_seqlen, head_num, head_dim/2]
     """
     xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
@@ -202,6 +201,20 @@ def apply_rotary_emb(
     # 即将xq转为复数后，与位置m的复数相乘，得到rope
     xq_out = torch.view_as_real(xq_complex * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_complex * freqs_cis).flatten(3)
+
+    """
+    最终,xq_out的复数表示为 
+    [batch==0, seq_len==0, head_num==0, head_dim= [ 
+                                                   q0*cos(m*theta0)-q1*sin(m*theta0),
+                                                   q1*cost(m*theta0)+q0*sin(m*theta0),
+                                                   q2*cos(m*theta1)-q3*sin(m*theta1),
+                                                   q3*cost(m*theta1)+q2*sin(m*theta1),
+                                                   ...
+                                                   q(d-2)*cos(m*theta(dim/2))-q(d-1)*sin(m*theta(dim/2)),
+                                                   q(d-1)*cos(m*theta(dim/2))-q(d-2)*sin(m*theta(dim/2))
+                                                ]
+  ]
+    """
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
