@@ -11,6 +11,8 @@ from typing import Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field, validator
 
 from typing_extensions import Annotated
+
+print(__name__)
 from ...datatypes import *  # noqa
 from ...schema_utils import json_schema_type
 

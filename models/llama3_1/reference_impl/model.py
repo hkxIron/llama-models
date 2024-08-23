@@ -21,7 +21,8 @@ from fairscale.nn.model_parallel.layers import (
 )
 from torch import nn
 
-from ..api import ModelArgs
+#print(__name__)
+from ..api.args import ModelArgs
 
 # **NOTE**: This code is not runnable without installing `torch` and `fairscale`
 # dependencies. These dependencies are not part of the default dependencies
@@ -180,7 +181,7 @@ def apply_rotary_emb(
     ...
     m*theta(0), m*theta(1), ..., m*theta(dim/2-1),
     ...
-    seq_len*theta(0), seq_len*theta(1), ..., seq_len*theta(dim/2-1),
+    seq_len*theta(0), seq_len*theta(1), ..., seq_len*theta(dim/2-1)
     ]
     xq_complex: [batch, query_seqlen, head_num, head_dim/2]
     将freqs_cis.shape变为[batch=1, query_seqlen=1024, head_num=1, head_dim/2=64]
@@ -205,9 +206,11 @@ def apply_rotary_emb(
     """
     最终,xq_out的复数表示为 
     [batch==0, seq_len==0, head_num==0, head_dim= [ 
-                                                   q0*cos(m*theta0)-q1*sin(m*theta0),
-                                                   q1*cost(m*theta0)+q0*sin(m*theta0),
-                                                   q2*cos(m*theta1)-q3*sin(m*theta1),
+                                                   q0*cos(0*theta0)-q1*sin(0*theta0),
+                                                   q1*cost(1*theta0)+q0*sin(1*theta0),
+                                                   q2*cos(2*theta1)-q3*sin(2*theta1),
+                                                   q3*cost(3*theta1)+q2*sin(3*theta1),
+                                                   ...
                                                    q3*cost(m*theta1)+q2*sin(m*theta1),
                                                    ...
                                                    q(d-2)*cos(m*theta(dim/2))-q(d-1)*sin(m*theta(dim/2)),
