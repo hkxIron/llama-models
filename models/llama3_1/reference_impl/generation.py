@@ -68,7 +68,7 @@ class Llama:
         max_batch_size: int,
         model_parallel_size: Optional[int] = None,
         seed: int = 1,
-    ):
+    ) -> "Llama":
         """
         Build a Llama instance by initializing and loading a model checkpoint.
 
@@ -104,6 +104,7 @@ class Llama:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
 
+        # seed must be the same in all processes
         torch.manual_seed(seed)
 
         if local_rank > 0:
@@ -153,6 +154,25 @@ class Llama:
         top_p: float = 0.9,
         logprobs: bool = False,
     ) -> Generator:
+        """
+        Generate text sequences based on provided prompts using the language generation model.
+
+        Args:
+            prompt_tokens (List[List[int]]): List of tokenized prompts, where each prompt is represented as a list of integers.
+            max_gen_len (int): Maximum length of the generated text sequence.
+            temperature (float, optional): Temperature value for controlling randomness in sampling. Defaults to 0.6.
+            top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
+            logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
+            echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
+
+        Returns:
+            Tuple[List[List[int]], Optional[List[List[float]]]]: A tuple containing generated token sequences and, if logprobs is True, corresponding token log probabilities.
+
+        Note:
+            This method uses the provided prompts as a basis for generating text. It employs nucleus sampling to produce text with controlled randomness.
+            If logprobs is True, token log probabilities are computed for each generated token.
+
+        """
         params = self.model.params
 
         # cprint("Input to model -> " + self.tokenizer.decode(model_input.tokens), "red")
@@ -241,6 +261,26 @@ class Llama:
         max_gen_len: Optional[int] = None,
         logprobs: bool = False,
     ) -> CompletionPrediction:
+        """
+        Perform text completion for a list of prompts using the language generation model.
+
+        Args:
+            prompts (List[str]): List of text prompts for completion.
+            temperature (float, optional): Temperature value for controlling randomness in sampling. Defaults to 0.6.
+            top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
+            max_gen_len (Optional[int], optional): Maximum length of the generated completion sequence.
+                If not provided, it's set to the model's maximum sequence length minus 1.
+            logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
+            echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
+
+        Returns:
+            List[CompletionPrediction]: List of completion predictions, each containing the generated text completion.
+
+        Note:
+            This method generates text completions for the provided prompts, employing nucleus sampling to introduce controlled randomness.
+            If logprobs is True, token log probabilities are computed for each generated token.
+
+        """
         if (
             max_gen_len is None
             or max_gen_len == 0
@@ -283,6 +323,30 @@ class Llama:
         max_gen_len: Optional[int] = None,
         logprobs: bool = False,
     ) -> ChatPrediction:
+        """
+        Generate assistant responses for a list of conversational dialogs using the language generation model.
+
+        Args:
+            dialogs (List[Dialog]): List of conversational dialogs, where each dialog is a list of messages.
+            temperature (float, optional): Temperature value for controlling randomness in sampling. Defaults to 0.6.
+            top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
+            max_gen_len (Optional[int], optional): Maximum length of the generated response sequence.
+                If not provided, it's set to the model's maximum sequence length minus 1.
+            logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
+
+        Returns:
+            List[ChatPrediction]: List of chat predictions, each containing the assistant's generated response.
+
+        Raises:
+            AssertionError: If the last message in a dialog is not from the user.
+            AssertionError: If the dialog roles are not in the required 'user', 'assistant', and optional 'system' order.
+
+        Note:
+            This method generates assistant responses for the provided conversational dialogs.
+            It employs nucleus sampling to introduce controlled randomness in text generation.
+            If logprobs is True, token log probabilities are computed for each generated token.
+
+        """
         if (
             max_gen_len is None
             or max_gen_len == 0
