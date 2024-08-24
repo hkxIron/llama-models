@@ -56,7 +56,7 @@ printf "Downloading LICENSE and Acceptable Usage Policy\n"
 wget --continue ${PRESIGNED_URL/'*'/"LICENSE"} -O ${TARGET_FOLDER}"/LICENSE"
 wget --continue ${PRESIGNED_URL/'*'/"USE_POLICY.md"} -O ${TARGET_FOLDER}"/USE_POLICY.md"
 
-for m in ${SELECTED_MODELS//,/ }
+for m in ${SELECTED_MODELS//,/ } # 用逗号分割，m为7B,8B等
 do
 
     ADDITIONAL_FILES=""

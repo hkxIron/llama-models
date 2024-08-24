@@ -74,7 +74,6 @@ class RMSNorm(torch.nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
-
 def apply_scaling(freqs: torch.Tensor):
     # Values obtained from grid search
     scale_factor = 8
@@ -86,6 +85,7 @@ def apply_scaling(freqs: torch.Tensor):
     high_freq_wavelen = old_context_len / high_freq_factor
     new_freqs = []
     for freq in freqs:
+        # 波长
         wavelen = 2 * math.pi / freq
         if wavelen < high_freq_wavelen:
             new_freqs.append(freq)
@@ -93,9 +93,7 @@ def apply_scaling(freqs: torch.Tensor):
             new_freqs.append(freq / scale_factor)
         else:
             assert low_freq_wavelen != high_freq_wavelen
-            smooth = (old_context_len / wavelen - low_freq_factor) / (
-                high_freq_factor - low_freq_factor
-            )
+            smooth = (old_context_len / wavelen - low_freq_factor) / ( high_freq_factor - low_freq_factor )
             new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
     return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
@@ -140,18 +138,19 @@ def precompute_freqs_cis(
     # freqs.shape: [dim//2]
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     # index_of_seq: [0, 1, 2, ..., 4095]
-    # index_of_seq.shape:[end]
+    # index_of_seq.shape:[seq_len]
     index_of_seq = torch.arange(seq_length, device=freqs.device, dtype=torch.float32)
     if use_scaled:
         freqs = apply_scaling(freqs)
 
     """
-    # freqs 得到 freqs和t的笛卡尔积，维度为:[seq_length, embed_dim//2] =（4096，64）
-    # freqs = [[0, 0, 0,..., 0],
-    #          [1/10000.0^(0/128), 1/10000.0^(2/128), 1/10000.0^(4/128), ..., 1/10000.0^(126/128)],
-    #          [2/10000.0^(0/128), 2/10000.0^(2/128), 2/10000.0^(4/128), ..., 2/10000.0^(126/128)],
-    #          ...,
-    #          [4095/10000.0^(0/128), 4095/10000.0^(2/128), 4095/10000.0^(4/128), ..., 4095/10000.0^(126/128)]]
+    freqs 得到 freqs和t的笛卡尔积
+    freqs:[seq_length, embed_dim//2] =（4096，64）
+    freqs = [[0, 0, 0,..., 0],
+             [1/10000.0^(0/128), 1/10000.0^(2/128), 1/10000.0^(4/128), ..., 1/10000.0^(126/128)],
+             [2/10000.0^(0/128), 2/10000.0^(2/128), 2/10000.0^(4/128), ..., 2/10000.0^(126/128)],
+             ...,
+             [4095/10000.0^(0/128), 4095/10000.0^(2/128), 4095/10000.0^(4/128), ..., 4095/10000.0^(126/128)]]
     其公式值为：
     [
         0*theta(0), 0*theta(1), ..., 0*theta(dim/2-1),
@@ -162,14 +161,19 @@ def precompute_freqs_cis(
         seq_len*theta(0), seq_len*theta(1), ..., seq_len*theta(dim/2-1),
         ]
     """
-    freqs = torch.outer(index_of_seq, freqs)
+    # index_of_seq.shape:[seq_len]
+    # freqs:[dim//2]
+    # freqs_angle:[seq_len, dim//2]
+    freqs_angle = torch.outer(index_of_seq, freqs)
 
-    # 在PyTorch中，torch.polar用于通过极坐标（magnitude和angle）来创建一个复数张量。
-    # 这个函数接受两个张量作为输入：一个张量包含复数的模（magnitude，也就是复数的长度），
-    # 另一个张量包含复数的角度（angle，也就是复数的相位角），然后返回一个相应的复数张量。
-    # 下面就是创建模长为1的，有不同相位角的复数张量。
-    # freqs_cis:[seq_length, embed_dim//2]
-    freqs_cis = torch.polar(abs=torch.ones_like(freqs), angle=freqs)  # complex64
+    """
+    在PyTorch中，torch.polar用于通过极坐标（magnitude和angle）来创建一个复数张量。
+    这个函数接受两个张量作为输入：一个张量包含复数的模（magnitude，也就是复数的长度），
+    另一个张量包含复数的角度（angle，也就是复数的相位角），然后返回一个相应的复数张量。
+    下面就是创建模长为1的，有不同相位角的复数张量。
+    freqs_cis:[seq_len, dim//2]
+    """
+    freqs_cis = torch.polar(abs=torch.ones_like(freqs), angle=freqs_angle)  # complex64
     return freqs_cis
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
@@ -246,6 +250,7 @@ def apply_rotary_emb(
     -> [batch, query_seqlen, head_num, head_dim/2, 2]
     torch.view_as_complex:其中输入张量的最后一个维度必须为2, 将相邻位置(q0,q1)作为复数的实部与虚部,其中偶数部分为实部，奇数部分为虚部
     具体而言，其中的复数为：[x0+j*x(1), x2+j*x3, ...., x(dim_2)+j*x(dim-1)], 长度为head_dim/2
+    此处reshape会将相邻位置当成复数的实部与虚部
     xq_complex: [batch, query_seqlen, head_num, head_dim/2]
     """
     xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
@@ -271,23 +276,32 @@ def apply_rotary_emb(
     """
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_complex)
 
-    # xq_complex: [batch, query_seqlen, head_num, head_dim/2]
-    # freqs_cis:[batch=1, query_seqlen=1024, head_num=1, head_dim/2=64]
-    # view_as_real和view_as_complex相反，可以将张量中最后一维的复数拆出实部和虚部
-    # (xq_ * freqs_cis).shape = [batch=2, seq_len, head_num=32 , head_dim/2=64]
-    # torch.view_as_real(xq_ * freqs_cis).shape = [batch=2, seq_len, head_num=32 , head_dim/2=64, 2]
-    # flatten(3)将张量展平为[batch=2, seq_len, head_num=32, head_dim=128]，3代表从的第3个维度开始展平
-    #
-    # xq_out:[batch, query_seqlen=1024, head_num, head_dim]
-    # xk_out:[batch, query_seqlen=1024, head_num, head_dim]
-    # ROPE编码, f(q, m) = q_complex*e^(i*m*theta)
-    # 其具有相对位置信息：<f(q,m), f(k,n)> = g(q,k,m-n) = (q.T)*R(n-m)*k
-    # 即将xq转为复数后，与位置m的复数相乘，得到rope
-    xq_out = torch.view_as_real(xq_complex * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_complex * freqs_cis).flatten(3)
+    """
+    ROPE编码, f(q, m) = q_complex*e^(i*m*theta)
+    其具有相对位置信息：<f(q,m), f(k,n)> = g(q,k,m-n) = (q.T)*R(n-m)*k
+    即将xq转为复数后，与位置m的复数相乘，得到rope
+    
+    xq_complex: [batch, query_seqlen, head_num, head_dim/2]
+    freqs_cis:  [batch=1, query_seqlen=1024, head_num=1, head_dim/2=64]
+    view_as_real和view_as_complex相反，可以将张量中最后一维的复数拆出实部和虚部
+    
+    xq_complex*freqs_cis为复数相乘, 即模长相乘，幅角相加,由于freqs_cis模长为1,因此只有幅角相加
+    xq_rope_complex.shape:[batch, seqlen, head_num, head_dim/2],结果为复数，有实部与虚部
+    xq_rope_real.shape = [batch=2, seq_len, head_num=32 , head_dim/2=64, 2]
+    xq_rope: flatten(3)将张量展平为[batch=2, seq_len, head_num=32, head_dim=128]，3代表从的第3个维度开始展平
+    
+    xq_rope:[batch, query_seqlen=1024, head_num, head_dim]
+    xk_rope:[batch, query_seqlen=1024, head_num, head_dim]
+    """
+    xq_rope_complex = xq_complex * freqs_cis
+    xq_rope_real = torch.view_as_real(xq_rope_complex)
+    xq_rope = xq_rope_real.flatten(3) # 从第3维head_dim//2开始，将后面所有维（head_dim//2, 2）展平
+
+
+    xk_rope = torch.view_as_real(xk_complex * freqs_cis).flatten(3)
 
     """
-    最终,xq_out的复数表示为 
+    最终,xq_rope的复数表示为 
     [batch==0, seq_len==0, head_num==0, head_dim= [ 
                                                    q0*cos(0*theta0)-q1*sin(0*theta0),
                                                    q1*cost(1*theta0)+q0*sin(1*theta0),
@@ -301,18 +315,21 @@ def apply_rotary_emb(
                                                 ]
   ]
     """
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    return xq_rope.type_as(xq), xk_rope.type_as(xk)
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    bs, slen, n_kv_heads, head_dim = x.shape
+    """
+    torch.repeat_interleave(x, dim=2, repeats=n_rep)
+    元素级别的复制，不是整体复制
+    """
+    bs, seq_len, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
     return (
         x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+        .expand(bs, seq_len, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, seq_len, n_kv_heads * n_rep, head_dim)
     )
 
 
@@ -341,10 +358,14 @@ class Attention(nn.Module):
         """
 
         super().__init__()
+        # n_kv_heads与n_heads默认相同
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+
+        # 模型并行的大小
         model_parallel_size = fs_init.get_model_parallel_world_size()
         self.n_local_heads = args.n_heads // model_parallel_size
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        # GQA, MQA中，多个query共享一个kv,实现时为了方便将kv复制多份以进行attention
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
@@ -357,18 +378,18 @@ class Attention(nn.Module):
         # 对于反向传播和梯度计算，每个设备计算其自己列的梯度，并可能需要与其他设备交换信息以更新权重。
         #
         # 这种方式可以显著减少每个设备上的内存需求，并允许训练更大的模型，因为模型的不同部分可以分布在多个设备上。
-        # ColumnParallelLinear和RowParallelLinear（另一种将权重矩阵按行划分的方法）是实现模型并行的两种常见策略。
+        # ColumnParallelLinear和RowParallelLinear（另一种将权重矩阵按行划分的方法）是实现模型并行(张量并行)的两种常见策略。
 
         self.wq = ColumnParallelLinear(
-            args.dim,
-            args.n_heads * self.head_dim,
+            in_features=args.dim,
+            out_features=args.n_heads * self.head_dim, # 会在out_features维度并行
             bias=False,
             gather_output=False,
             init_method=lambda x: x,
         )
         self.wk = ColumnParallelLinear(
             args.dim,
-            self.n_kv_heads * self.head_dim,
+            self.n_kv_heads * self.head_dim, # 会在out_features维度并行
             bias=False,
             gather_output=False,
             init_method=lambda x: x,
@@ -381,7 +402,7 @@ class Attention(nn.Module):
             init_method=lambda x: x,
         )
         self.wo = RowParallelLinear(
-            args.n_heads * self.head_dim,
+            args.n_heads * self.head_dim, # 会在in_feature维度并行
             args.dim,
             bias=False,
             input_is_parallel=True,
@@ -389,11 +410,12 @@ class Attention(nn.Module):
         )
 
         # kv_cache是缓存键值对，在训练过程中，我们只保存最近n个键值对
+        # 按照最大的batch,最长的seq_len来分配cache内存
         self.cache_k = torch.zeros(
             (
                 args.max_batch_size,
                 args.max_seq_len,
-                self.n_local_kv_heads,
+                self.n_local_kv_heads, # 注意是 local_kv_heads
                 self.head_dim,
             )
         ).cuda()
@@ -437,50 +459,73 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
-        batch_size, seqlen, hidden_size = x.shape
+        batch_size, seq_len, hidden_size = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        # xq:[batch, seqlen, head_num, head_dim]
-        # xk:[batch, seqlen, n_kv_head, head_dim]
-        # xv:[batch, seqlen, h_kv_head, head_dim]
-        xq = xq.view(batch_size, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(batch_size, seqlen, self.n_local_kv_heads, self.head_dim) # 注意：这里就是group query attention
-        xv = xv.view(batch_size, seqlen, self.n_local_kv_heads, self.head_dim)
+        # xq:[batch, seq_len, head_num, head_dim]
+        # xk:[batch, seq_len, n_kv_head, head_dim]
+        # xv:[batch, seq_len, h_kv_head, head_dim]
+        xq = xq.view(batch_size, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim) # 注意：这里就是group query attention
+        xv = xv.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
 
-        # 对当前token的qkv计算位置编码ROPE
-        # xq:[batch, seqlen, head_num, head_dim]
-        # xk:[batch, seqlen, n_kv_head, head_dim]
-        # freqs_cis:[seq_length, embed_dim//2]
+        """
+        对当前token的qkv计算位置编码ROPE
+        注意：ROPE是乘性位置编码，在每一层attention时都需要显式加入位置信息,
+        但在google原始encoder-decoder的Transfomer中，使用的是sin-cos-position,
+        并且只在第一层加入位置信息,而rope是需要每层均加入位置信息
+        
+        xq:[batch, seq_len, head_num, head_dim]
+        xk:[batch, seq_len, n_kv_head, head_dim]
+        freqs_cis:[seq_length, embed_dim//2]
+        """
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        # 缓存当前token的kv
+        # 缓存当前token的kv,将数据复制到xq的设备上
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
 
-        self.cache_k[:batch_size, start_pos: start_pos + seqlen] = xk
-        self.cache_v[:batch_size, start_pos: start_pos + seqlen] = xv
+        """
+        训练阶段不能缓存kv cache，因为参数一直在变,此处因为meta给的是推理代码，所以可以用kv cache.
+        """
+        # 将key/value缓存起来
+        self.cache_k[:batch_size, start_pos: start_pos + seq_len] = xk
+        self.cache_v[:batch_size, start_pos: start_pos + seq_len] = xv
 
         # 取出前seqlen个token的kv缓存
-        keys = self.cache_k[:batch_size, : start_pos + seqlen]
-        values = self.cache_v[:batch_size, : start_pos + seqlen]
+        keys = self.cache_k[:batch_size, : start_pos + seq_len]
+        values = self.cache_v[:batch_size, : start_pos + seq_len]
 
-        # repeat k/v heads if n_kv_heads < n_heads, 即group query attention
+        # repeat k/v heads if n_kv_heads < n_heads, 即group query attention或multi query attention
         # 将kv重复填充，使kv和q的头数个数相同
-        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        values = repeat_kv( values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        """
+        keys/value:[batch, cache_len+seq_len, n_local_kv_heads, head_dim] 
+          => [batch, cache_len+seq_len, n_local_heads, head_dim] 
+        """
+        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seq_len, n_local_heads, head_dim)
+        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seq_len, n_local_heads, head_dim)
 
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose( 1, 2 )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seq_len, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seq_len, head_dim)
+        values = values.transpose( 1, 2 )  # (bs, n_local_heads, cache_len + seq_len, head_dim)
+        # scores:[batch, n_local_heads, seq_len, cache_len+seq_len]
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            # 如果mask存在，mask值为-inf
+            scores = scores + mask  # (bs, n_local_heads, seq_len, cache_len + seq_len)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(batch_size, seqlen, -1)
-        return self.wo(output)
-
+        # scores:[batch, n_local_heads, seq_len, cache_len+seq_len]
+        # values:[batch, n_local_heads, cache_len + seq_len, head_dim]
+        # attn_value: (batch, n_local_heads, seq_len, head_dim)
+        attn_value = torch.matmul(scores, values)
+        # attn_value: [batch, n_local_heads, seq_len, head_dim]
+        #          => [batch, seq_len, n_local_heads, head_dim]
+        #          => [batch, seq_len, n_local_heads* head_dim]
+        attn_value = attn_value.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        # output: [batch, seq_len, dim]
+        output = self.wo(attn_value)
+        return output
 
 class FeedForward(nn.Module):
     def __init__(
