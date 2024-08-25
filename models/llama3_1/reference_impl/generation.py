@@ -107,6 +107,7 @@ class Llama:
         # seed must be the same in all processes
         torch.manual_seed(seed)
 
+        # 其它gpu不打印日志
         if local_rank > 0:
             sys.stdout = open(os.devnull, "w")
 
@@ -114,9 +115,9 @@ class Llama:
 
         checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
         assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}"
-        assert model_parallel_size == len(
-            checkpoints
-        ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
+        assert model_parallel_size == len(checkpoints), \
+            f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
+
         ckpt_path = checkpoints[get_model_parallel_rank()]
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         with open(Path(ckpt_dir) / "params.json", "r") as f:
@@ -127,17 +128,21 @@ class Llama:
             max_batch_size=max_batch_size,
             **params,
         )
+
         tokenizer = Tokenizer(model_path=tokenizer_path)
         assert model_args.vocab_size == tokenizer.n_words
+
         if torch.cuda.is_bf16_supported():
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
         else:
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
-        model = Transformer(model_args)
-        model.load_state_dict(checkpoint, strict=False)
+
+        transformer_model = Transformer(model_args)
+        transformer_model.load_state_dict(checkpoint, strict=False)
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
 
-        return Llama(model, tokenizer, model_args)
+        llama = Llama(transformer_model, tokenizer, model_args)
+        return llama
 
     def __init__(self, model: Transformer, tokenizer: Tokenizer, args: ModelArgs):
         self.args = args
@@ -176,30 +181,39 @@ class Llama:
         params = self.model.params
 
         # cprint("Input to model -> " + self.tokenizer.decode(model_input.tokens), "red")
+        # prompt_tokens:List[List[int]]
         prompt_tokens = [model_input.tokens]
 
-        bsz = 1
-        assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
+        batch = 1
+        assert batch <= params.max_batch_size, (batch, params.max_batch_size)
 
+        # prompt_tokens:List[List[int]]
+        # 最长的prompt
+        # 最短的prompt
         min_prompt_len = min(len(t) for t in prompt_tokens)
         max_prompt_len = max(len(t) for t in prompt_tokens)
 
         if max_prompt_len >= params.max_seq_len:
-            cprint(
-                f"Out of token budget {max_prompt_len} vs {params.max_seq_len}", "red"
-            )
+            cprint(f"Out of token budget {max_prompt_len} vs {params.max_seq_len}", "red" )
             return
 
+        # 生成 + prompt必须小于max_seq_len
         total_len = min(max_gen_len + max_prompt_len, params.max_seq_len)
         pad_id = self.tokenizer.pad_id
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
-        for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+        tokens = torch.full((batch, total_len), fill_value=pad_id, dtype=torch.long, device="cuda")
+
+        # 将prompt copy到tokens中去
+        # prompt_tokens:List[List[int]], shape:[batch, seq_len]
+        for text_index, text_tokens in enumerate(prompt_tokens):
+            tokens[text_index, : len(text_tokens)] = torch.tensor(data=text_tokens, dtype=torch.long, device="cuda")
+
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
         prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
+        eos_reached = torch.tensor([False] * batch, device="cuda")
+        # input_text_mask.shape: [batch, seq_len]
+        # input_text_mask==1,为prompt值
         input_text_mask = tokens != pad_id
         if min_prompt_len == total_len:
             logits = self.model.forward(tokens, prev_pos)
@@ -210,22 +224,27 @@ class Llama:
                 ignore_index=pad_id,
             )
 
+        # List[int]
         stop_tokens = torch.tensor(self.tokenizer.stop_tokens)
 
+        # 从最短的prompt开始生成
         for cur_pos in range(min_prompt_len, total_len):
-            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            # logits:[batch, seq_len, vocab_size]
+            logits = self.model.forward(tokens=tokens[:, prev_pos:cur_pos], start_pos=prev_pos)
 
             if temperature > 0:
+                # 取所有batch的最后的一个token的logits,即seq_len=-1
+                # probs:[batch, vocab_size]
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                # next_token:[batch, 1]
                 next_token = sample_top_p(probs, top_p)
             else:
                 next_token = torch.argmax(logits[:, -1], dim=-1)
 
+            # next_token:[batch, 1]
             next_token = next_token.reshape(-1)
             # only replace token if prompt has already been generated
-            next_token = torch.where(
-                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
-            )
+            next_token = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token)
             tokens[:, cur_pos] = next_token
 
             target = tokens[:, prev_pos + 1 : cur_pos + 1]
@@ -236,20 +255,19 @@ class Llama:
                     reduction="none",
                     ignore_index=pad_id,
                 )
-            eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                torch.isin(next_token, stop_tokens)
-            )
+
+            # 如果是生成的token，且在stop_tokens里
+            eos_reached |= (~input_text_mask[:, cur_pos]) & (torch.isin(next_token, stop_tokens))
             yield TokenResult(
                 token=next_token[0].item(),
                 text=self.tokenizer.decode(next_token.tolist()),
                 logprobs=(
-                    token_logprobs[:, prev_pos + 1 : cur_pos + 1][0].tolist()
-                    if logprobs
-                    else None
+                    token_logprobs[:, prev_pos + 1 : cur_pos + 1][0].tolist() if logprobs else None
                 ),
             )
 
             prev_pos = cur_pos
+            # 所有的都到了eos,退出
             if all(eos_reached):
                 break
 
@@ -281,13 +299,13 @@ class Llama:
             If logprobs is True, token log probabilities are computed for each generated token.
 
         """
-        if (
-            max_gen_len is None
+        if ( max_gen_len is None
             or max_gen_len == 0
             or max_gen_len >= self.model.params.max_seq_len
         ):
             max_gen_len = self.model.params.max_seq_len - 1
 
+        # prompt_tokens: List[int]
         prompt_tokens = self.tokenizer.encode(prompt, bos=True, eos=False)
 
         tokens = []
@@ -391,8 +409,9 @@ class Llama:
         return ChatPrediction(generation=message)
 
 
-def sample_top_p(probs, p):
+def sample_top_p(probs:torch.Tensor, p:float):
     """
+    Top-p 核采样
     Perform top-p (nucleus) sampling on a probability distribution.
 
     Args:
@@ -406,11 +425,20 @@ def sample_top_p(probs, p):
         Top-p sampling selects the smallest set of tokens whose cumulative probability mass
         exceeds the threshold p. The distribution is renormalized based on the selected tokens.
     """
+    # probs:[batch, vocab_size]
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+    # probs:[batch, vocab_size]
     probs_sum = torch.cumsum(probs_sort, dim=-1)
+    # probs_sum-probs_sort就是去除当前位置的累积和
+    # 其实就是probs_sum>p, 唯一的区别就是去除当前位置是否>p
     mask = probs_sum - probs_sort > p
+    # mask为true的地方都是后面的小概率
     probs_sort[mask] = 0.0
+    # probs_sort:[batch, vocab_size], 重新归一化
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    next_token = torch.multinomial(probs_sort, num_samples=1)
-    next_token = torch.gather(probs_idx, -1, next_token)
+    # next_token:[batch], 多项式采样
+    rand_index = torch.multinomial(probs_sort, num_samples=1)
+    # probs_idx:[batch, vocab_size]
+    # next_token:[batch]
+    next_token = torch.gather(input=probs_idx, dim=-1, index=rand_index)
     return next_token

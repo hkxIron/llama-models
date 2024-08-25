@@ -487,6 +487,7 @@ class Attention(nn.Module):
 
         """
         训练阶段不能缓存kv cache，因为参数一直在变,此处因为meta给的是推理代码，所以可以用kv cache.
+        因此start_pos是在推理阶段的参数
         """
         # 将key/value缓存起来
         self.cache_k[:batch_size, start_pos: start_pos + seq_len] = xk
@@ -515,6 +516,7 @@ class Attention(nn.Module):
             # 如果mask存在，mask值为-inf
             scores = scores + mask  # (bs, n_local_heads, seq_len, cache_len + seq_len)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        # 注意：在llama inference中，attention里并没有dropout
         # scores:[batch, n_local_heads, seq_len, cache_len+seq_len]
         # values:[batch, n_local_heads, cache_len + seq_len, head_dim]
         # attn_value: (batch, n_local_heads, seq_len, head_dim)
@@ -555,6 +557,7 @@ class FeedForward(nn.Module):
         # custom dim factor multiplier
         if ffn_dim_multiplier is not None:
             intermediate_size = int(ffn_dim_multiplier * intermediate_size)
+        # multiple_of:保证intermediate_size必须是multiple_of的整数倍
         intermediate_size = multiple_of * ((intermediate_size + multiple_of - 1) // multiple_of)
 
         #
@@ -586,7 +589,9 @@ class FeedForward(nn.Module):
         )
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        # 现在激活函数在gate中
+        gate = F.silu(self.w1(x))
+        return self.w2(gate * self.w3(x))
 
 
 class TransformerBlock(nn.Module):
@@ -627,7 +632,7 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
+        start_pos: int, # 推理时kv cache使用
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
@@ -647,6 +652,7 @@ class TransformerBlock(nn.Module):
         # freqs_cis:[seq_length, embed_dim//2]
         h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
         out = h + self.feed_forward(self.ffn_norm(h))
+        # out: [batch, seq_len, dim]
         return out
 
 
@@ -674,20 +680,21 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
-        self.tok_embeddings = VocabParallelEmbedding(
-            params.vocab_size, params.dim, init_method=lambda x: x
-        )
+        # tok_embeddings:[vocab_size, embed_size]
+        self.tok_embeddings = VocabParallelEmbedding(params.vocab_size, params.dim, init_method=lambda x: x)
 
         self.layers = torch.nn.ModuleList()
+
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         # 列并行Linear,Y=XA+b, 对A各列进行拆分
-        self.output = ColumnParallelLinear(
+        self.lm_head = ColumnParallelLinear(
             params.dim, params.vocab_size, bias=False, init_method=lambda x: x
         )
 
+        # freqs_cis: [seq_len, dim // 2]
         self.freqs_cis = precompute_freqs_cis(
             # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
@@ -697,6 +704,7 @@ class Transformer(nn.Module):
             params.use_scaled_rope,
         )
 
+    # 注意：这里只有推理阶段的代码
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
         """
@@ -710,27 +718,38 @@ class Transformer(nn.Module):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        _bsz, seqlen = tokens.shape
+        batch, seqlen = tokens.shape
+        # h: [batch, seqlen, embed_size]
         h = self.tok_embeddings(tokens)
+        # self.freqs_cis: [max_seq_len, dim // 2]
         self.freqs_cis = self.freqs_cis.to(h.device)
+        # freqs_cis: [seq_len, dim // 2]
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
         if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
+            mask = torch.full((seqlen, seqlen), fill_value=float("-inf"), device=tokens.device)
+            mask = torch.triu(mask, diagonal=1) # 下三角置0, 对角线与下三角均置0
 
-            mask = torch.triu(mask, diagonal=1)
-
+            # 推理时，只计算非mask部分attention,mask部分attention不计算
+            # 即mask为:[seqlen, cache_len+seqlen], 而不是[cache_len+seq_len]
+            #
             # When performing key-value caching, we compute the attention scores
             # only for the new sequence. Thus, the matrix of scores is of size
             # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
             # j > cache_len + i, since row i corresponds to token cache_len + i.
-            mask = torch.hstack(
-                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
-            ).type_as(h)
+            #
+            # hstack进行水平concat
+            mask_for_cache = torch.zeros((seqlen, start_pos), device=tokens.device)
+            mask = torch.hstack([mask_for_cache, mask]).type_as(h)
 
+        # h: [batch, seq_len, dim]
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
+
+        # 最后进行一次rms_norm
+        # h: [batch, seq_len, dim]
         h = self.norm(h)
-        output = self.output(h).float()
-        return output
+        # logits: [batch, seq_len, vocab_size]
+        logits = self.lm_head(h).float()
+        return logits

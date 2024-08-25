@@ -80,7 +80,6 @@ class ChatFormat:
 
         # Add the start of an assistant message for the model to complete.
         tokens.extend(self.encode_header(Role.assistant.value))
-
         return ModelInput(tokens=tokens)
 
     # TODO(this should be generic, not only for assistant messages)

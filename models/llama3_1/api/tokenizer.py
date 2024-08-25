@@ -82,7 +82,7 @@ class Tokenizer:
         ]
         special_tokens = special_tokens + reserved_tokens
 
-        self.special_tokens = {
+        self.special_tokens:Dict[str, int] = {
             token: num_base_tokens + i for i, token in enumerate(special_tokens)
         }
         self.model = tiktoken.Encoding(
@@ -93,14 +93,16 @@ class Tokenizer:
         )
 
         self.n_words: int = num_base_tokens + len(special_tokens)
+
         # BOS / EOS token IDs
+        # self.special_tokens: Dict[str, int]
         self.bos_id: int = self.special_tokens["<|begin_of_text|>"]
         self.eos_id: int = self.special_tokens["<|end_of_text|>"]
         self.eot_id: int = self.special_tokens["<|eot_id|>"]
         self.eom_id: int = self.special_tokens["<|eom_id|>"]
         self.python_tag_id = self.special_tokens["<|python_tag|>"]
         self.pad_id: int = self.special_tokens["<|finetune_right_pad_id|>"]
-        self.stop_tokens = [
+        self.stop_tokens:List[int] = [
             self.special_tokens["<|eom_id|>"],
             self.special_tokens["<|eot_id|>"],
         ]
@@ -142,10 +144,11 @@ class Tokenizer:
         substrs = (
             substr
             for i in range(0, len(s), TIKTOKEN_MAX_ENCODE_CHARS)
-            for substr in self._split_whitespaces_or_nonwhitespaces(
-                s[i : i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
-            )
+                for substr in self._split_whitespaces_or_nonwhitespaces(
+                    s[i : i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
+                )
         )
+
         t: List[int] = []
         for substr in substrs:
             t.extend(

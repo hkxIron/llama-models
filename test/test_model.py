@@ -1,5 +1,18 @@
+from typing import Callable
+
 from models.llama3_1.reference_impl.model import * # 绝对导入
 from util import setup_seed
+from models.llama3_1.reference_impl.generation import *
+
+def my_decorator(func:Callable):
+    def my_wrapper(*args, **kwargs):
+        #start_time = time.time()
+        print("="*30+f" {func.__name__} begin "+"="*30)
+        result = func(*args, **kwargs)
+        print(f"{func.__name__} end\n\n")
+        #end_time = time.time()
+        return result
+    return my_wrapper
 
 def show_paths():
     import sys
@@ -8,6 +21,7 @@ def show_paths():
     print("sys path:", sys.path)
     #sys.path.append()
 
+@my_decorator
 def test_rope():
     head_dim=6
     seq_len=4
@@ -29,7 +43,18 @@ def test_rope():
     print("query_rope[0][1]:\n", query_rope[0][1])
     print("query_rope[1][1]:\n", query_rope[1][1])
 
+@my_decorator
+def test_sample_top_p():
+    batch=2
+    vocab=5
+    probs = torch.randn((batch, vocab)).abs()
+    probs.div_(probs.sum(dim=-1, keepdim=True))
+    print(probs)
+    token_ids = sample_top_p(probs, p=0.9)
+    print(token_ids)
+
 if __name__ == "__main__":
     show_paths()
     setup_seed(3407)
     test_rope()
+    test_sample_top_p()

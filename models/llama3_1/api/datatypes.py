@@ -139,7 +139,7 @@ class CompletionMessage(BaseModel):
     stop_reason: StopReason
     tool_calls: List[ToolCall] = Field(default_factory=list)
 
-
+# 这里加入了注释
 Message = Annotated[
     Union[
         UserMessage,
