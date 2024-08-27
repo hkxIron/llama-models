@@ -54,10 +54,15 @@ class ChatPrediction:
 
 @dataclass
 class TokenResult:
-    token: int
-    text: str
+    token_id: Optional[int] = None
+    text: str = None
     logprobs: Optional[List[float]] = None
 
+@dataclass
+class BatchTokenResult:
+    token_id: Optional[List[int]] = None
+    text: List[str] = None
+    logprobs: Optional[List[List[float]]] = None
 
 class Llama:
     @staticmethod
@@ -182,9 +187,13 @@ class Llama:
 
         # cprint("Input to model -> " + self.tokenizer.decode(model_input.tokens), "red")
         # prompt_tokens:List[List[int]]
-        prompt_tokens = [model_input.tokens]
+        if model_input.tokens is not None:
+            prompt_tokens = [model_input.tokens]
+            batch = 1
+        else:
+            prompt_tokens = model_input.batch_tokens
+            batch = len(prompt_tokens)
 
-        batch = 1
         assert batch <= params.max_batch_size, (batch, params.max_batch_size)
 
         # prompt_tokens:List[List[int]]
@@ -200,18 +209,21 @@ class Llama:
         # 生成 + prompt必须小于max_seq_len
         total_len = min(max_gen_len + max_prompt_len, params.max_seq_len)
         pad_id = self.tokenizer.pad_id
-        tokens = torch.full((batch, total_len), fill_value=pad_id, dtype=torch.long, device="cuda")
+        #tokens = torch.full((batch, total_len), fill_value=pad_id, dtype=torch.long, device="cuda")
+        tokens = torch.full((batch, total_len), fill_value=pad_id, dtype=torch.long, device="cpu")
 
         # 将prompt copy到tokens中去
         # prompt_tokens:List[List[int]], shape:[batch, seq_len]
         for text_index, text_tokens in enumerate(prompt_tokens):
-            tokens[text_index, : len(text_tokens)] = torch.tensor(data=text_tokens, dtype=torch.long, device="cuda")
+            #tokens[text_index, : len(text_tokens)] = torch.tensor(data=text_tokens, dtype=torch.long, device="cuda")
+            tokens[text_index, : len(text_tokens)] = torch.tensor(data=text_tokens, dtype=torch.long, device="cpu")
 
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
         prev_pos = 0
-        eos_reached = torch.tensor([False] * batch, device="cuda")
+        #eos_reached = torch.tensor([False] * batch, device="cuda")
+        eos_reached = torch.tensor([False] * batch, device="cpu") # shape:[batch]
         # input_text_mask.shape: [batch, seq_len]
         # input_text_mask==1,为prompt值
         input_text_mask = tokens != pad_id
@@ -227,10 +239,10 @@ class Llama:
         # List[int]
         stop_tokens = torch.tensor(self.tokenizer.stop_tokens)
 
-        # 从最短的prompt开始生成
+        # 从最短的prompt开始生成, 那些比较长的prompt的地方生成的token丢弃不用
         for cur_pos in range(min_prompt_len, total_len):
             # logits:[batch, seq_len, vocab_size]
-            logits = self.model.forward(tokens=tokens[:, prev_pos:cur_pos], start_pos=prev_pos)
+            logits = self.model.forward(tokens=tokens[:, prev_pos:cur_pos], start_pos=prev_pos) # 将prompt+ 已生成的token直接copy进去
 
             if temperature > 0:
                 # 取所有batch的最后的一个token的logits,即seq_len=-1
@@ -258,13 +270,22 @@ class Llama:
 
             # 如果是生成的token，且在stop_tokens里
             eos_reached |= (~input_text_mask[:, cur_pos]) & (torch.isin(next_token, stop_tokens))
-            yield TokenResult(
-                token=next_token[0].item(),
-                text=self.tokenizer.decode(next_token.tolist()),
-                logprobs=(
-                    token_logprobs[:, prev_pos + 1 : cur_pos + 1][0].tolist() if logprobs else None
-                ),
-            )
+            if batch==1:
+                yield TokenResult(
+                    token_id=next_token[0].item(),
+                    text=self.tokenizer.decode(next_token.tolist()),
+                    logprobs=(
+                        token_logprobs[:, prev_pos + 1 : cur_pos + 1][0].tolist() if logprobs else None
+                    ),
+                )
+            else:
+                yield BatchTokenResult(
+                    token_id=next_token.tolist(),
+                    text=[self.tokenizer.decode([x]) for x in next_token.tolist()],
+                    logprobs=(
+                        token_logprobs[:, prev_pos + 1 : cur_pos + 1].tolist() if logprobs else None
+                    ),
+                )
 
             prev_pos = cur_pos
             # 所有的都到了eos,退出
@@ -308,30 +329,20 @@ class Llama:
         # prompt_tokens: List[int]
         prompt_tokens = self.tokenizer.encode(prompt, bos=True, eos=False)
 
-        tokens = []
+        token_ids = []
         token_logprobs = []
         decoded_tokens = []
-        for result in self.generate(
-            model_input=ModelInput(tokens=prompt_tokens),
-            max_gen_len=max_gen_len,
-            temperature=temperature,
-            top_p=top_p,
-            logprobs=logprobs,
-        ):
-            tokens.append(result.token)
+        for result in self.generate( model_input=ModelInput(tokens=prompt_tokens), max_gen_len=max_gen_len, temperature=temperature, top_p=top_p, logprobs=logprobs,):
+            token_ids.append(result.token_id)
             if logprobs:
                 decoded_tokens.append(result.text)
                 token_logprobs.append(result.logprobs)
 
-        generation = self.tokenizer.decode(tokens)
+        generation_tokens = self.tokenizer.decode(token_ids)
         if logprobs:
-            return CompletionPrediction(
-                generation=generation,
-                logprobs=token_logprobs,
-                decoded_tokens=decoded_tokens,
-            )
+            return CompletionPrediction(generation=generation_tokens, logprobs=token_logprobs, decoded_tokens=decoded_tokens, )
 
-        return CompletionPrediction(generation=generation)
+        return CompletionPrediction(generation=generation_tokens)
 
     def chat_completion(
         self,
@@ -372,19 +383,17 @@ class Llama:
         ):
             max_gen_len = self.model.params.max_seq_len - 1
 
-        tokens = []
+        token_ids = []
         token_logprobs = []
         decoded_tokens = []
 
         stop_reason = None
-        for result in self.generate(
-            model_input=self.formatter.encode_dialog_prompt(messages),
-            max_gen_len=max_gen_len,
+        for result in self.generate(model_input=self.formatter.encode_dialog_prompt(messages), max_gen_len=max_gen_len,
             temperature=temperature,
             top_p=top_p,
             logprobs=logprobs,
         ):
-            tokens.append(result.token)
+            token_ids.append(result.token_id)
             if result.text == "<|eot_id|>":
                 stop_reason = StopReason.end_of_turn
             elif result.text == "<|eom_id|>":
@@ -397,14 +406,10 @@ class Llama:
         if stop_reason is None:
             stop_reason = StopReason.out_of_tokens
 
-        message = self.formatter.decode_assistant_message(tokens, stop_reason)
+        message = self.formatter.decode_assistant_message(token_ids, stop_reason)
 
         if logprobs:
-            return ChatPrediction(
-                generation=message,
-                logprobs=token_logprobs,
-                decoded_tokens=decoded_tokens,
-            )
+            return ChatPrediction( generation=message, logprobs=token_logprobs, decoded_tokens=decoded_tokens, )
 
         return ChatPrediction(generation=message)
 

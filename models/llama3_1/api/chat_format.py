@@ -7,7 +7,7 @@
 
 import uuid
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List
 
 from .tokenizer import Tokenizer
@@ -17,7 +17,8 @@ from .tool_utils import ToolUtils
 
 @dataclass
 class ModelInput:
-    tokens: List[int]
+    tokens: List[int]=field(default=None)
+    batch_tokens: List[List[int]] = field(default=None)
 
 
 class ChatFormat:

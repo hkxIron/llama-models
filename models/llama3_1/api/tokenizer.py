@@ -61,7 +61,7 @@ class Tokenizer:
         """
         assert os.path.isfile(model_path), model_path
 
-        mergeable_ranks = load_tiktoken_bpe(model_path)
+        mergeable_ranks:Dict[bytes, int] = load_tiktoken_bpe(model_path)
         num_base_tokens = len(mergeable_ranks)
         special_tokens = [
             "<|begin_of_text|>",
@@ -121,7 +121,7 @@ class Tokenizer:
 
         Args:
             s (str): The input string to be encoded.
-            bos (bool): Whether to prepend the beginning-of-sequence token.
+            bos (bool): Whether to prepend the beginning-of-sequence token. prepend: 预置；前置；预先考虑；预先准备；预追加
             eos (bool): Whether to append the end-of-sequence token.
             allowed_tokens ("all"|set[str]): allowed special tokens in string
             disallowed_tokens ("all"|set[str]): special tokens that raise an error when in string
@@ -144,14 +144,12 @@ class Tokenizer:
         substrs = (
             substr
             for i in range(0, len(s), TIKTOKEN_MAX_ENCODE_CHARS)
-                for substr in self._split_whitespaces_or_nonwhitespaces(
-                    s[i : i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
-                )
+                for substr in self._split_whitespaces_or_nonwhitespaces(s[i : i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS)
         )
 
-        t: List[int] = []
+        token_ids: List[int] = []
         for substr in substrs:
-            t.extend(
+            token_ids.extend(
                 self.model.encode(
                     substr,
                     allowed_special=allowed_special,
@@ -159,23 +157,23 @@ class Tokenizer:
                 )
             )
         if bos:
-            t.insert(0, self.bos_id)
+            token_ids.insert(0, self.bos_id)
         if eos:
-            t.append(self.eos_id)
-        return t
+            token_ids.append(self.eos_id)
+        return token_ids
 
-    def decode(self, t: Sequence[int]) -> str:
+    def decode(self, token_ids: Sequence[int]) -> str:
         """
         Decodes a list of token IDs into a string.
 
         Args:
-            t (List[int]): The list of token IDs to be decoded.
+            token_ids (List[int]): The list of token IDs to be decoded.
 
         Returns:
             str: The decoded string.
         """
         # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
-        return self.model.decode(cast(List[int], t))
+        return self.model.decode(cast(List[int], token_ids))
 
     @staticmethod
     def _split_whitespaces_or_nonwhitespaces(

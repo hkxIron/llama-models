@@ -11,15 +11,17 @@
 import math
 from typing import Optional, Tuple
 
-import fairscale.nn.model_parallel.initialize as fs_init
+#import fairscale.nn.model_parallel.initialize as fs_init
 import torch
 import torch.nn.functional as F
-from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
+# from fairscale.nn.model_parallel.layers import (
+#     ColumnParallelLinear,
+#     RowParallelLinear,
+#     VocabParallelEmbedding,
+# )
 from torch import nn
+from torch.nn import Embedding
+from torch.nn import Linear
 
 #print(__name__)
 from ..api.args import ModelArgs
@@ -362,7 +364,8 @@ class Attention(nn.Module):
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
 
         # 模型并行的大小
-        model_parallel_size = fs_init.get_model_parallel_world_size()
+        #model_parallel_size = fs_init.get_model_parallel_world_size()
+        model_parallel_size = 1
         self.n_local_heads = args.n_heads // model_parallel_size
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         # GQA, MQA中，多个query共享一个kv,实现时为了方便将kv复制多份以进行attention
@@ -380,34 +383,52 @@ class Attention(nn.Module):
         # 这种方式可以显著减少每个设备上的内存需求，并允许训练更大的模型，因为模型的不同部分可以分布在多个设备上。
         # ColumnParallelLinear和RowParallelLinear（另一种将权重矩阵按行划分的方法）是实现模型并行(张量并行)的两种常见策略。
 
-        self.wq = ColumnParallelLinear(
-            in_features=args.dim,
-            out_features=args.n_heads * self.head_dim, # 会在out_features维度并行
-            bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
-        )
-        self.wk = ColumnParallelLinear(
+        # self.wq = ColumnParallelLinear( in_features=args.dim,
+        #     out_features=args.n_heads * self.head_dim, # 会在out_features维度并行
+        #     bias=False,
+        #     gather_output=False,
+        #     init_method=lambda x: x,
+        # )
+        # self.wk = ColumnParallelLinear(
+        #     args.dim,
+        #     self.n_kv_heads * self.head_dim, # 会在out_features维度并行
+        #     bias=False,
+        #     gather_output=False,
+        #     init_method=lambda x: x,
+        # )
+        # self.wv = ColumnParallelLinear(
+        #     args.dim,
+        #     self.n_kv_heads * self.head_dim,
+        #     bias=False,
+        #     gather_output=False,
+        #     init_method=lambda x: x,
+        # )
+        # self.wo = RowParallelLinear(
+        #     args.n_heads * self.head_dim, # 会在in_feature维度并行
+        #     args.dim,
+        #     bias=False,
+        #     input_is_parallel=True,
+        #     init_method=lambda x: x,
+        # )
+
+        self.wq = Linear( in_features=args.dim,
+                                        out_features=args.n_heads * self.head_dim, # 会在out_features维度并行
+                                        bias=False)
+        self.wk = Linear(
             args.dim,
             self.n_kv_heads * self.head_dim, # 会在out_features维度并行
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
-        )
-        self.wv = ColumnParallelLinear(
+            )
+        self.wv = Linear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
-        )
-        self.wo = RowParallelLinear(
+            )
+        self.wo = Linear(
             args.n_heads * self.head_dim, # 会在in_feature维度并行
             args.dim,
             bias=False,
-            input_is_parallel=True,
-            init_method=lambda x: x,
-        )
+            )
 
         # kv_cache是缓存键值对，在训练过程中，我们只保存最近n个键值对
         # 按照最大的batch,最长的seq_len来分配cache内存
@@ -418,7 +439,7 @@ class Attention(nn.Module):
                 self.n_local_kv_heads, # 注意是 local_kv_heads
                 self.head_dim,
             )
-        ).cuda()
+        ) #.cuda()
         self.cache_v = torch.zeros(
             (
                 args.max_batch_size,
@@ -426,7 +447,7 @@ class Attention(nn.Module):
                 self.n_local_kv_heads,
                 self.head_dim,
             )
-        ).cuda()
+        ) #.cuda()
 
     """
     大模型一般是分布式训练，这里涉及到几个概念。n_heads是注意力头的总个数，由于并行机制，每个进程会有n_local_heads个注意力头。
@@ -566,8 +587,11 @@ class FeedForward(nn.Module):
           A = | A_1, A_2,..., A_p |
         fairscale现已被fsdp替代  
         """
-        self.w1 = ColumnParallelLinear(
-            dim, intermediate_size, bias=False, gather_output=False, init_method=lambda x: x
+        # self.w1 = ColumnParallelLinear(
+        #     dim, intermediate_size, bias=False, gather_output=False, init_method=lambda x: x
+        # )
+        self.w1 = Linear(
+            dim, intermediate_size, bias=False,
         )
 
         #
@@ -581,11 +605,17 @@ class FeedForward(nn.Module):
               | A_p |
                -   -
         """
-        self.w2 = RowParallelLinear(
-            intermediate_size, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+        # self.w2 = RowParallelLinear(
+        #     intermediate_size, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+        # )
+        # self.w3 = ColumnParallelLinear(
+        #     dim, intermediate_size, bias=False, gather_output=False, init_method=lambda x: x
+        # )
+        self.w2 = Linear(
+            intermediate_size, dim, bias=False
         )
-        self.w3 = ColumnParallelLinear(
-            dim, intermediate_size, bias=False, gather_output=False, init_method=lambda x: x
+        self.w3 = Linear(
+            dim, intermediate_size, bias=False
         )
 
     def forward(self, x):
@@ -681,7 +711,8 @@ class Transformer(nn.Module):
         self.n_layers = params.n_layers
 
         # tok_embeddings:[vocab_size, embed_size]
-        self.tok_embeddings = VocabParallelEmbedding(params.vocab_size, params.dim, init_method=lambda x: x)
+        #self.tok_embeddings = VocabParallelEmbedding(params.vocab_size, params.dim, init_method=lambda x: x)
+        self.tok_embeddings = Embedding(params.vocab_size, params.dim)
 
         self.layers = torch.nn.ModuleList()
 
@@ -690,9 +721,8 @@ class Transformer(nn.Module):
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         # 列并行Linear,Y=XA+b, 对A各列进行拆分
-        self.lm_head = ColumnParallelLinear(
-            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
-        )
+        #self.lm_head = ColumnParallelLinear(params.dim, params.vocab_size, bias=False, init_method=lambda x: x)
+        self.lm_head = Linear(params.dim, params.vocab_size, bias=False)
 
         # freqs_cis: [seq_len, dim // 2]
         self.freqs_cis = precompute_freqs_cis(
