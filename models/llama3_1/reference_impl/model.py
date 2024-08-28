@@ -480,7 +480,7 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
-        batch_size, seq_len, hidden_size = x.shape
+        batch_size, seq_len, hidden_size = x.shape # 在推理阶段，过了prompt prefilling阶段，每次输入的x长度为1, seq_len=1
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
         # xq:[batch, seq_len, head_num, head_dim]
@@ -508,9 +508,9 @@ class Attention(nn.Module):
 
         """
         训练阶段不能缓存kv cache，因为参数一直在变,此处因为meta给的是推理代码，所以可以用kv cache.
-        因此start_pos是在推理阶段的参数
+        start_pos也只是在推理阶段的参数，训练时无此参数
         """
-        # 将key/value缓存起来
+        # 将当前的key/value缓存起来
         self.cache_k[:batch_size, start_pos: start_pos + seq_len] = xk
         self.cache_v[:batch_size, start_pos: start_pos + seq_len] = xv
 
@@ -530,10 +530,16 @@ class Attention(nn.Module):
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seq_len, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seq_len, head_dim)
         values = values.transpose( 1, 2 )  # (bs, n_local_heads, cache_len + seq_len, head_dim)
+        """
+        注意：在推理阶段，过了prompt prefilling后,采用kv cache,每次计算新输入的token的attention，seqlen均为1,因此xq的实际shape均为： (bs, n_local_heads, seq_len=1, head_dim),
+        因此此时也不再需要mask,mask均为None, 这样大大节省了计算量
+        """
         # scores:[batch, n_local_heads, seq_len, cache_len+seq_len]
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if mask is not None:
+            # 推理阶段，只有在第一次prompt_prefill时，mask才不为None
+            # 过了prompt_prefill阶段后，mask均为None, 每次只生成一个token
             # 如果mask存在，mask值为-inf
             scores = scores + mask  # (bs, n_local_heads, seq_len, cache_len + seq_len)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
@@ -756,8 +762,7 @@ class Transformer(nn.Module):
         # freqs_cis: [seq_len, dim // 2]
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
-        mask = None
-        if seqlen > 1:
+        if seqlen > 1: # 第一次生成prompt prefill时，seqlen>1，其它时都是seqlen=1,因为后面每次只输入一个token, mask均为None
             mask = torch.full((seqlen, seqlen), fill_value=float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=1) # 下三角置0, 对角线与下三角均置0
 
@@ -772,6 +777,9 @@ class Transformer(nn.Module):
             # hstack进行水平concat
             mask_for_cache = torch.zeros((seqlen, start_pos), device=tokens.device)
             mask = torch.hstack([mask_for_cache, mask]).type_as(h)
+        else:
+            # 在推理阶段，过了prompt prefilling后， 后面每次只输入一个token, mask均为None
+            mask = None
 
         # h: [batch, seq_len, dim]
         for layer in self.layers:
