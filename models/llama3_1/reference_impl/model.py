@@ -266,22 +266,28 @@ def apply_rotary_emb(
     freqs_cis:[seq_length, embed_dim//2]
     其值为：
     [
-    0*theta(0), 0*theta(1), ..., 0*theta(dim/2-1),
-    1*theta(0), 1*theta(1), ..., 1*theta(dim/2-1),
-    ...
-    m*theta(0), m*theta(1), ..., m*theta(dim/2-1),
-    ...
-    seq_len*theta(0), seq_len*theta(1), ..., seq_len*theta(dim/2-1)
+        0*theta(0), 0*theta(1), ..., 0*theta(dim/2-1),
+        1*theta(0), 1*theta(1), ..., 1*theta(dim/2-1),
+        ...
+        m*theta(0), m*theta(1), ..., m*theta(dim/2-1),
+        ...
+        seq_len*theta(0), seq_len*theta(1), ..., seq_len*theta(dim/2-1)
     ]
+    
     xq_complex: [batch, query_seqlen, head_num, head_dim/2]
+    
     将freqs_cis.shape变为[batch=1, query_seqlen=1024, head_num=1, head_dim/2=64]
     """
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_complex)
 
+
     """
+    GPT-J style RoPE
+    
     ROPE编码, f(q, m) = q_complex*e^(i*m*theta)
     其具有相对位置信息：<f(q,m), f(k,n)> = g(q,k,m-n) = (q.T)*R(n-m)*k
     即将xq转为复数后，与位置m的复数相乘，得到rope
+    
     
     xq_complex: [batch, query_seqlen, head_num, head_dim/2]
     freqs_cis:  [batch=1, query_seqlen=1024, head_num=1, head_dim/2=64]
@@ -290,13 +296,13 @@ def apply_rotary_emb(
     xq_complex*freqs_cis为复数相乘, 即模长相乘，幅角相加,由于freqs_cis模长为1,因此只有幅角相加
     xq_rope_complex.shape:[batch, seqlen, head_num, head_dim/2],结果为复数，有实部与虚部
     xq_rope_real.shape = [batch=2, seq_len, head_num=32 , head_dim/2=64, 2]
-    xq_rope: flatten(3)将张量展平为[batch=2, seq_len, head_num=32, head_dim=128]，3代表从的第3个维度开始展平
+    xq_rope: flatten(3)将张量展平为[batch=2, seq_len, head_num=32, head_dim=128]，3代表从的第3个维度开始展平, 即虚数的实部与虚部又分别作为矩阵的相邻元素
     
     xq_rope:[batch, query_seqlen=1024, head_num, head_dim]
     xk_rope:[batch, query_seqlen=1024, head_num, head_dim]
     """
     xq_rope_complex = xq_complex * freqs_cis
-    xq_rope_real = torch.view_as_real(xq_rope_complex)
+    xq_rope_real = torch.view_as_real(xq_rope_complex) # 在复数空间中旋转后又还原成实数
     xq_rope = xq_rope_real.flatten(3) # 从第3维head_dim//2开始，将后面所有维（head_dim//2, 2）展平
 
 
@@ -306,11 +312,11 @@ def apply_rotary_emb(
     最终,xq_rope的复数表示为 
     [batch==0, seq_len==0, head_num==0, head_dim= [ 
                                                    q0*cos(0*theta0)-q1*sin(0*theta0),
-                                                   q1*cost(1*theta0)+q0*sin(1*theta0),
+                                                   q1*cos(1*theta0)+q0*sin(1*theta0),
                                                    q2*cos(2*theta1)-q3*sin(2*theta1),
-                                                   q3*cost(3*theta1)+q2*sin(3*theta1),
+                                                   q3*cos(3*theta1)+q2*sin(3*theta1),
                                                    ...
-                                                   q3*cost(m*theta1)+q2*sin(m*theta1),
+                                                   q3*cos(m*theta1)+q2*sin(m*theta1),
                                                    ...
                                                    q(d-2)*cos(m*theta(dim/2))-q(d-1)*sin(m*theta(dim/2)),
                                                    q(d-1)*cos(m*theta(dim/2))-q(d-2)*sin(m*theta(dim/2))
@@ -430,6 +436,7 @@ class Attention(nn.Module):
             bias=False,
             )
 
+        # cache: [max_batch_size, max_seq_len, n_local_kv_heads, head_dim]
         # kv_cache是缓存键值对，在训练过程中，我们只保存最近n个键值对
         # 按照最大的batch,最长的seq_len来分配cache内存
         self.cache_k = torch.zeros(
@@ -440,6 +447,7 @@ class Attention(nn.Module):
                 self.head_dim,
             )
         ) #.cuda()
+
         self.cache_v = torch.zeros(
             (
                 args.max_batch_size,
@@ -487,7 +495,7 @@ class Attention(nn.Module):
         # xk:[batch, seq_len, n_kv_head, head_dim]
         # xv:[batch, seq_len, h_kv_head, head_dim]
         xq = xq.view(batch_size, seq_len, self.n_local_heads, self.head_dim)
-        xk = xk.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim) # 注意：这里就是group query attention
+        xk = xk.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim) # 注意：这里就是multi group attention
         xv = xv.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
 
         """
@@ -734,9 +742,9 @@ class Transformer(nn.Module):
         self.freqs_cis = precompute_freqs_cis(
             # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
-            params.dim // params.n_heads,
+            params.dim // params.n_heads, # head_dim
             params.max_seq_len * 2,
-            params.rope_theta,
+            params.rope_theta, # 50*10000
             params.use_scaled_rope,
         )
 
